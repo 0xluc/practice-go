@@ -1,6 +1,20 @@
 package main
 
-import "text/template"
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"html"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"text/template"
+	"unicode/utf8"
+
+	"github.com/skip2/go-qrcode"
+)
 
 var ScamThresold float64 = 0.005 // minimum donation
 var MediaMin float64 = 0.025     // unused
@@ -33,7 +47,7 @@ var topWidgetTemplate *template.Template
 type configJson struct {
 	MinimumDonation  float64  `json:"minimum_donation"`
 	MaxMessageChars  int      `json:"max_message_chars"`
-	maxNameChars     int      `json:"max_name_chars"`
+	MaxNameChars     int      `json:"max_name_chars"`
 	RPCWalletURL     string   `json:"rpc_wallet_url"`
 	WebViewUsername  string   `json:"web_view_username"`
 	WebViewPassword  string   `json:"web_view_password"`
@@ -80,7 +94,7 @@ type csvLog struct {
 
 type indexDisplay struct {
 	MaxChar int
-	minAmnt float64
+	MinAmnt float64
 	Checked string
 }
 
@@ -177,4 +191,126 @@ type GetTransferResponse struct {
 	} `json:"result"`
 }
 
-func main() {}
+func main() {
+	jsonFile, err := os.Open("config.json")
+	if err != nil {
+		fmt.Println(err)
+	}
+	fmt.Println("reading config.json")
+	//this function execs itself to close the file after the main function is over
+	defer func(jsonFile *os.File) {
+		err := jsonFile.Close()
+		if err != nil {
+			fmt.Println(err)
+		}
+	}(jsonFile)
+	byteValue, _ := io.ReadAll(jsonFile)
+	var conf configJson
+	err = json.Unmarshal(byteValue, &conf)
+	if err != nil {
+		panic(err)
+	}
+
+	ScamThresold = conf.MinimumDonation
+	MessageMaxChar = conf.MaxMessageChars
+	NameMaxChar = conf.MaxNameChars
+	rpcURL = conf.RPCWalletURL
+	username = conf.WebViewUsername
+	password = conf.WebViewPassword
+	AlertWidgetRefreshInterval = conf.OBSWidgetRefresh
+	enableEmail = conf.EnableEmail
+	smtpHost = conf.SMTPServer
+	smtpPost = conf.SMTPPort
+	smtpUser = conf.SMTPUser
+	smtpPass = conf.SMTPPass
+	sendTo = conf.SendToEmail
+	if conf.Checked == true {
+		checked = " checked"
+	}
+
+	fmt.Println(fmt.Sprintf("email notifications enabled?: %t", enableEmail))
+	fmt.Println(fmt.Sprintf("OBS Alert path: /alert?auth=%s", password))
+
+	http.HandleFunc("/style.css", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "web/style.css")
+	})
+	http.HandleFunc("/xmr.svg", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "web/xmr.svg")
+	})
+
+	http.HandleFunc("/", indexHandler)
+	http.HandleFunc("/pay", paymentHandler)
+
+}
+
+func truncateStrings(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for !utf8.ValidString(s[:n]) {
+		n--
+	}
+	return s[:n]
+}
+func condenseSpaces(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+func indexHandler(w http.ResponseWriter, _ *http.Request) {
+	var i indexDisplay
+	i.MaxChar = MessageMaxChar
+	i.MinAmnt = ScamThresold
+	i.Checked = checked
+	err := indexTemplate.Execute(w, i)
+	if err != nil {
+		fmt.Println(err)
+	}
+}
+
+func paymentHandler(w http.ResponseWriter, r *http.Request) {
+	payload := strings.NewReader(`{"jsonrpc":"2.0", "id":"0","method":"make_integrated_address"}`)
+	req, err := http.NewRequest("POST", rpcURL, payload)
+	if err == nil {
+		req.Header.Set("Content-Type", "applications/json")
+		res, err := http.DefaultClient.Do(req)
+		if err == nil {
+			resp := &rpcResponse{}
+			if err := json.NewDecoder(res.Body).Decode(resp); err != nil {
+				fmt.Println(err.Error())
+			}
+
+			var s superChat
+			s.Amount = html.EscapeString(r.FormValue("amount"))
+			if r.FormValue("amount") == "" {
+				s.Amount = fmt.Sprint(ScamThresold)
+			}
+			if r.FormValue("amount") == "" {
+				s.Name = "Anonymous"
+			} else {
+				s.Name = html.EscapeString(truncateStrings(condenseSpaces(r.FormValue("name")), NameMaxChar))
+			}
+			s.Message = html.EscapeString(truncateStrings(condenseSpaces(r.FormValue("message")), MessageMaxChar))
+			s.Media = html.EscapeString(r.FormValue("media"))
+			s.PayID = html.EscapeString(resp.Result.PaymentID)
+			s.Address = resp.Result.IntegratedAddress
+
+			params := url.Values{}
+			params.Add("id", resp.Result.PaymentID)
+			params.Add("name", s.Name)
+			params.Add("msg", r.FormValue("message"))
+			params.Add("media", condenseSpaces(s.Media))
+			params.Add("show", html.EscapeString(r.FormValue("showAmount")))
+			s.CheckURL = params.Encode()
+
+			tmp, _ := qrcode.Encode(fmt.Sprintf("monero:%s?tx_amount=%s", resp.Result.IntegratedAddress, s.Amount), qrcode.Low, 320)
+			s.QRB64 = base64.StdEncoding.EncodeToString(tmp)
+			err := payTemplate.Execute(w, s)
+			if err != nil {
+				fmt.Println(err)
+			}
+
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+}
