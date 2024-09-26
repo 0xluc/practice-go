@@ -240,7 +240,36 @@ func main() {
 
 	http.HandleFunc("/", indexHandler)
 	http.HandleFunc("/pay", paymentHandler)
+	http.HandleFunc("/check", checkHandler)
 
+}
+
+func checkHandler(w http.ResponseWriter, r *http.Request) {
+	payload := strings.NewReader(`{"jsonrpc":"2.0","id":"0","method":"get_address"}`)
+	req, _ := http.NewRequest("POST", rpcURL, payload)
+	req.Header.Set("Content-Type", "application/json")
+	res, _ := http.DefaultClient.Do(req)
+	resp := &getAddress{}
+
+	if err := json.NewDecoder(res.Body).Decode(resp); err != nil {
+		fmt.Println(err.Error())
+	}
+
+	var c checkPage
+	c.Meta = `<meta http-equiv="Refresh" content="3">`
+	c.Addy = resp.Result.Address
+	c.PayID = r.FormValue("id")
+	c.Name = truncateStrings(r.FormValue("name"), NameMaxChar)
+	c.Msg = truncateStrings(r.FormValue("msg"), MessageMaxChar)
+	c.Media = r.FormValue("media")
+	c.Receipt = "Waiting for payment..."
+
+	payload2 := strings.NewReader(`{"jsonrpc":"2.0", "id":"0","method":"get_transfers","params":{"in":true, "pool":true, "account_index":0}}`)
+	req2, _ := http.NewRequest("POST", "http://127.0.0.1:28088/json_rpc", payload2)
+
+	req2.Header.Set("Content-type", "application/json")
+	res2, _ := http.DefaultClient.Do(req2)
+	resp2 := &GetTransferResponse{}
 }
 
 func truncateStrings(s string, n int) string {
